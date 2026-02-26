@@ -1,0 +1,648 @@
+"""
+Vanna AI NL-to-SQL Service for Dremio with OpenAI-compatible API
+Connects to Dremio via REST API and provides OpenAI chat completions endpoint
+"""
+
+import os
+import json
+import time
+import uuid
+import logging
+from typing import List, Optional, Dict, Any, AsyncGenerator
+from contextlib import asynccontextmanager
+
+import httpx
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import chromadb
+from openai import OpenAI
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+DREMIO_HOST = os.getenv(
+    "DREMIO_HOST", "dremio-client.hyperplane-dremio.svc.cluster.local"
+)
+DREMIO_PORT = int(os.getenv("DREMIO_PORT", "9047"))
+DREMIO_USERNAME = os.getenv("DREMIO_USERNAME", "admin")
+DREMIO_PASSWORD = os.getenv("DREMIO_PASSWORD", "Shakudo312!")
+DREMIO_SSL = os.getenv("DREMIO_SSL", "false").lower() == "true"
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
+
+CHROMA_PATH = os.getenv("CHROMA_PATH", "/tmp/chroma_db")
+
+TABLE_NAME = 'minio."mcp-reports-test".mcp_parquet'
+
+# =============================================================================
+# Dremio Client
+# =============================================================================
+
+
+class DremioClient:
+    """Client for interacting with Dremio REST API"""
+
+    def __init__(self):
+        self.base_url = (
+            f"{'https' if DREMIO_SSL else 'http'}://{DREMIO_HOST}:{DREMIO_PORT}"
+        )
+        self.token = None
+        self.client = httpx.Client(timeout=60.0)
+
+    def login(self) -> bool:
+        """Authenticate with Dremio and get token"""
+        try:
+            response = self.client.post(
+                f"{self.base_url}/apiv2/login",
+                json={"userName": DREMIO_USERNAME, "password": DREMIO_PASSWORD},
+            )
+            response.raise_for_status()
+            data = response.json()
+            self.token = data.get("token")
+            logger.info("Successfully authenticated with Dremio")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to authenticate with Dremio: {e}")
+            return False
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Get headers with auth token"""
+        return {
+            "Authorization": f"_dremio{self.token}",
+            "Content-Type": "application/json",
+        }
+
+    def execute_sql(self, sql: str) -> pd.DataFrame:
+        """Execute SQL query and return DataFrame"""
+        if not self.token:
+            self.login()
+
+        try:
+            # Submit job
+            response = self.client.post(
+                f"{self.base_url}/api/v3/sql",
+                headers=self._get_headers(),
+                json={"sql": sql},
+            )
+            response.raise_for_status()
+            job_data = response.json()
+            job_id = job_data.get("id")
+
+            # Poll for job completion
+            max_attempts = 60
+            for _ in range(max_attempts):
+                status_response = self.client.get(
+                    f"{self.base_url}/api/v3/job/{job_id}", headers=self._get_headers()
+                )
+                status_response.raise_for_status()
+                status_data = status_response.json()
+                job_state = status_data.get("jobState")
+
+                if job_state == "COMPLETED":
+                    break
+                elif job_state in ["FAILED", "CANCELED"]:
+                    error_msg = status_data.get("errorMessage", "Unknown error")
+                    raise Exception(f"Query failed: {error_msg}")
+
+                time.sleep(0.5)
+            else:
+                raise Exception("Query timeout")
+
+            # Get results
+            results_response = self.client.get(
+                f"{self.base_url}/api/v3/job/{job_id}/results",
+                headers=self._get_headers(),
+                params={"offset": 0, "limit": 500},
+            )
+            results_response.raise_for_status()
+            results_data = results_response.json()
+
+            # Convert to DataFrame
+            rows = results_data.get("rows", [])
+            if rows:
+                df = pd.DataFrame(rows)
+                return df
+            return pd.DataFrame()
+
+        except Exception as e:
+            logger.error(f"Error executing SQL: {e}")
+            raise
+
+
+# =============================================================================
+# Vanna AI NL-to-SQL Engine
+# =============================================================================
+
+
+class VannaNLToSQL:
+    """Custom NL-to-SQL engine using OpenAI and ChromaDB"""
+
+    def __init__(self, dremio_client: DremioClient):
+        self.dremio = dremio_client
+        self.openai = OpenAI(api_key=OPENAI_API_KEY)
+        self.model = OPENAI_MODEL
+
+        # Initialize ChromaDB
+        self.chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+        self.ddl_collection = self.chroma_client.get_or_create_collection("ddl")
+        self.sql_collection = self.chroma_client.get_or_create_collection(
+            "sql_examples"
+        )
+        self.doc_collection = self.chroma_client.get_or_create_collection(
+            "documentation"
+        )
+
+        # Train on schema
+        self._train_on_schema()
+
+    def _train_on_schema(self):
+        """Train on the Dremio table schema"""
+        # DDL for the table
+        ddl = """
+        Table: minio."mcp-reports".mcp_parquet
+        
+        Columns:
+        - _meta_resort: VARCHAR - Resort name (PURGATORY, PAJARITO, SANDIA, WILLAMETTE, Sipapu, Nordic, Snowbowl)
+        - _meta_proc: VARCHAR - Process type (budget)
+        - _meta_date_start: VARCHAR - Start date (YYYY-MM-DD format)
+        - _meta_date_end: VARCHAR - End date (YYYY-MM-DD format)
+        - _meta_run_id: VARCHAR - Run ID timestamp
+        - DepartmentTitle: VARCHAR - Department name (Lift Operations, Ski Patrol, Tickets, IT Services, Marketing, etc.)
+        - Type: VARCHAR - Type of data (Payroll, Revenue, Visits)
+        - Amount: DECIMAL(7,2) - Dollar amount or count value
+        - department: VARCHAR - Department code
+        - deptcode: INTEGER - Department code number
+        """
+
+        # Add DDL to ChromaDB if not exists
+        existing = self.ddl_collection.get(ids=["main_ddl"])
+        if not existing["ids"]:
+            self.ddl_collection.add(documents=[ddl], ids=["main_ddl"])
+
+        # Add example SQL queries
+        examples = [
+            {
+                "question": "What is the total budget for Purgatory resort?",
+                "sql": """SELECT _meta_resort, Type, SUM(Amount) as total 
+                         FROM minio."mcp-reports-test".mcp_parquet 
+                         WHERE UPPER(_meta_resort) = 'PURGATORY' 
+                         GROUP BY _meta_resort, Type""",
+            },
+            {
+                "question": "Show payroll by department for Sandia",
+                "sql": """SELECT DepartmentTitle, SUM(Amount) as total_payroll 
+                         FROM minio."mcp-reports-test".mcp_parquet 
+                         WHERE UPPER(_meta_resort) = 'SANDIA' AND Type = 'Payroll' 
+                         GROUP BY DepartmentTitle 
+                         ORDER BY total_payroll DESC""",
+            },
+            {
+                "question": "What is the revenue for all resorts?",
+                "sql": """SELECT _meta_resort, SUM(Amount) as total_revenue 
+                         FROM minio."mcp-reports-test".mcp_parquet 
+                         WHERE Type = 'Revenue' 
+                         GROUP BY _meta_resort 
+                         ORDER BY total_revenue DESC""",
+            },
+            {
+                "question": "How many visits for each resort?",
+                "sql": """SELECT _meta_resort, SUM(Amount) as total_visits 
+                         FROM minio."mcp-reports-test".mcp_parquet 
+                         WHERE Type = 'Visits' 
+                         GROUP BY _meta_resort""",
+            },
+            {
+                "question": "Show budget for the last 7 days",
+                "sql": """SELECT _meta_resort, Type, _meta_date_start, SUM(Amount) as total 
+                         FROM minio."mcp-reports-test".mcp_parquet 
+                         WHERE CAST(_meta_date_start AS DATE) >= CURRENT_DATE - INTERVAL '7' DAY 
+                         GROUP BY _meta_resort, Type, _meta_date_start 
+                         ORDER BY _meta_date_start DESC""",
+            },
+        ]
+
+        for i, ex in enumerate(examples):
+            ex_id = f"example_{i}"
+            existing = self.sql_collection.get(ids=[ex_id])
+            if not existing["ids"]:
+                self.sql_collection.add(
+                    documents=[f"Question: {ex['question']}\nSQL: {ex['sql']}"],
+                    metadatas=[{"question": ex["question"], "sql": ex["sql"]}],
+                    ids=[ex_id],
+                )
+
+        # Add documentation
+        doc = """
+        This database contains ski resort budget data from MinIO storage.
+        
+        Available resorts: PURGATORY, PAJARITO, SANDIA, WILLAMETTE, Sipapu, Nordic, Snowbowl
+        
+        Data types:
+        - Payroll: Staff salary and labor costs by department
+        - Revenue: Income from tickets, retail, food service, ski school, rentals
+        - Visits: Number of visitors (daily tickets, season passes, comp tickets)
+        
+        Common departments:
+        - Lift Operations, Ski Patrol, Tickets, IT Services, Marketing
+        - Mountain G&A, General Administration, Executive
+        - Ski School, Rentals, Facilities Maintenance
+        - Retail, Cafe/Food service
+        
+        Date fields are in VARCHAR format (YYYY-MM-DD), use CAST for date comparisons.
+        Resort names may be uppercase or mixed case - use UPPER() for comparisons.
+        """
+
+        existing = self.doc_collection.get(ids=["main_doc"])
+        if not existing["ids"]:
+            self.doc_collection.add(documents=[doc], ids=["main_doc"])
+
+        logger.info("Schema training complete")
+
+    def _get_context(self, question: str) -> str:
+        """Get relevant context from ChromaDB"""
+        context_parts = []
+
+        # Get DDL
+        ddl_results = self.ddl_collection.query(query_texts=[question], n_results=1)
+        if ddl_results["documents"]:
+            context_parts.append("## Table Schema\n" + ddl_results["documents"][0][0])
+
+        # Get similar SQL examples
+        sql_results = self.sql_collection.query(query_texts=[question], n_results=3)
+        if sql_results["documents"]:
+            context_parts.append("## Similar SQL Examples")
+            for doc in sql_results["documents"][0]:
+                context_parts.append(doc)
+
+        # Get documentation
+        doc_results = self.doc_collection.query(query_texts=[question], n_results=1)
+        if doc_results["documents"]:
+            context_parts.append("## Documentation\n" + doc_results["documents"][0][0])
+
+        return "\n\n".join(context_parts)
+
+    def generate_sql(self, question: str) -> str:
+        """Generate SQL from natural language question"""
+        context = self._get_context(question)
+
+        system_prompt = """You are an expert SQL analyst for Dremio. Generate SQL queries based on user questions.
+
+IMPORTANT RULES:
+1. ALWAYS use the full table path: minio."mcp-reports-test".mcp_parquet
+2. Resort names may be mixed case - use UPPER(_meta_resort) for comparisons
+3. Date fields (_meta_date_start, _meta_date_end) are VARCHAR - use CAST for date operations
+4. Return ONLY the SQL query, no explanations
+5. Use proper Dremio SQL syntax
+
+Available columns: _meta_resort, _meta_proc, _meta_date_start, _meta_date_end, DepartmentTitle, Type, Amount, department, deptcode"""
+
+        user_prompt = f"""Context:
+{context}
+
+Question: {question}
+
+Generate the SQL query:"""
+
+        response = self.openai.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+        )
+
+        sql = response.choices[0].message.content.strip()
+
+        # Clean up SQL (remove markdown code blocks if present)
+        if sql.startswith("```"):
+            sql = sql.split("\n", 1)[1] if "\n" in sql else sql[3:]
+        if sql.endswith("```"):
+            sql = sql[:-3]
+        sql = sql.strip()
+
+        return sql
+
+    def ask(self, question: str) -> Dict[str, Any]:
+        """Process question: generate SQL, execute, and return results"""
+        try:
+            # Generate SQL
+            sql = self.generate_sql(question)
+            logger.info(f"Generated SQL: {sql}")
+
+            # Execute SQL
+            df = self.dremio.execute_sql(sql)
+
+            # Format results
+            if df.empty:
+                result_text = "No results found."
+            else:
+                result_text = df.to_markdown(index=False)
+
+            return {
+                "question": question,
+                "sql": sql,
+                "results": df.to_dict(orient="records"),
+                "result_text": result_text,
+                "row_count": len(df),
+            }
+
+        except Exception as e:
+            logger.error(f"Error processing question: {e}")
+            return {"question": question, "error": str(e)}
+
+
+# =============================================================================
+# OpenAI-Compatible API Models
+# =============================================================================
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "vanna-dremio"
+    messages: List[ChatMessage]
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = None
+    stream: Optional[bool] = False
+    stop: Optional[List[str]] = None
+
+
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatMessage
+    finish_reason: str
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[ChatCompletionChoice]
+    usage: UsageInfo
+
+
+class ModelInfo(BaseModel):
+    id: str
+    object: str = "model"
+    created: int
+    owned_by: str
+
+
+class ModelsResponse(BaseModel):
+    object: str = "list"
+    data: List[ModelInfo]
+
+
+# =============================================================================
+# FastAPI Application
+# =============================================================================
+
+# Global instances
+dremio_client: Optional[DremioClient] = None
+vanna_engine: Optional[VannaNLToSQL] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize services on startup"""
+    global dremio_client, vanna_engine
+
+    logger.info("Starting Vanna Dremio NL-to-SQL Service...")
+
+    # Initialize Dremio client
+    dremio_client = DremioClient()
+    if not dremio_client.login():
+        logger.warning("Failed to connect to Dremio - will retry on first request")
+
+    # Initialize Vanna engine
+    vanna_engine = VannaNLToSQL(dremio_client)
+
+    logger.info("Service initialized successfully")
+    yield
+
+    logger.info("Shutting down...")
+
+
+app = FastAPI(
+    title="Vanna Dremio NL-to-SQL Service",
+    description="Natural language to SQL translation for Dremio with OpenAI-compatible API",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =============================================================================
+# API Endpoints
+# =============================================================================
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+
+@app.get("/v1/models")
+async def list_models():
+    """List available models (OpenAI-compatible)"""
+    return ModelsResponse(
+        data=[
+            ModelInfo(id="vanna-dremio", created=int(time.time()), owned_by="shakudo"),
+            ModelInfo(id="vanna-nl2sql", created=int(time.time()), owned_by="shakudo"),
+        ]
+    )
+
+
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str):
+    """Get model info (OpenAI-compatible)"""
+    return ModelInfo(id=model_id, created=int(time.time()), owned_by="shakudo")
+
+
+async def generate_streaming_response(
+    question: str, model: str, completion_id: str
+) -> AsyncGenerator[str, None]:
+    """Generate streaming response in OpenAI format"""
+    created = int(time.time())
+
+    # Initial chunk with role
+    initial_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }
+        ],
+    }
+    yield f"data: {json.dumps(initial_chunk)}\n\n"
+
+    try:
+        # Process the question
+        result = vanna_engine.ask(question)
+
+        if "error" in result:
+            response_text = f"I encountered an error: {result['error']}"
+        else:
+            # Format nice response
+            response_text = (
+                f"I've translated your question into SQL and executed it.\n\n"
+            )
+            response_text += f"**SQL Query:**\n```sql\n{result['sql']}\n```\n\n"
+            response_text += f"**Results ({result['row_count']} rows):**\n"
+            response_text += result["result_text"]
+
+        # Stream the response in chunks
+        chunk_size = 20
+        for i in range(0, len(response_text), chunk_size):
+            chunk_text = response_text[i : i + chunk_size]
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": chunk_text},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+    except Exception as e:
+        error_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": f"\n\nError: {str(e)}"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+
+    # Final chunk
+    final_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    yield f"data: {json.dumps(final_chunk)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    """OpenAI-compatible chat completions endpoint"""
+
+    # Get the last user message
+    user_messages = [m for m in request.messages if m.role == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="No user message provided")
+
+    question = user_messages[-1].content
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+
+    if request.stream:
+        return StreamingResponse(
+            generate_streaming_response(question, request.model, completion_id),
+            media_type="text/event-stream",
+        )
+
+    # Non-streaming response
+    try:
+        result = vanna_engine.ask(question)
+
+        if "error" in result:
+            response_text = f"I encountered an error: {result['error']}"
+        else:
+            response_text = (
+                f"I've translated your question into SQL and executed it.\n\n"
+            )
+            response_text += f"**SQL Query:**\n```sql\n{result['sql']}\n```\n\n"
+            response_text += f"**Results ({result['row_count']} rows):**\n"
+            response_text += result["result_text"]
+
+        return ChatCompletionResponse(
+            id=completion_id,
+            created=int(time.time()),
+            model=request.model,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=response_text),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(
+                prompt_tokens=len(question.split()),
+                completion_tokens=len(response_text.split()),
+                total_tokens=len(question.split()) + len(response_text.split()),
+            ),
+        )
+
+    except Exception as e:
+        logger.error(f"Error in chat completion: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/query")
+async def direct_query(request: dict):
+    """Direct query endpoint for testing"""
+    question = request.get("question")
+    if not question:
+        raise HTTPException(status_code=400, detail="Question required")
+
+    result = vanna_engine.ask(question)
+    return result
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8787"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
