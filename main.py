@@ -41,7 +41,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
 CHROMA_PATH = os.getenv("CHROMA_PATH", "/tmp/chroma_db")
 
-TABLE_NAME = 'minio."mcp-reports-test".mcp_parquet'
+TABLE_BASE = 'minio."mcp-reports"."mcp_parquet"'
 
 # =============================================================================
 # Dremio Client
@@ -168,19 +168,61 @@ class VannaNLToSQL:
         """Train on the Dremio table schema"""
         # DDL for the table
         ddl = """
-        Table: minio."mcp-reports".mcp_parquet
-        
+        Data is stored in MinIO as partitioned Parquet files accessed via Dremio using partition-path syntax.
+        Each process type is a separate virtual table. Base path: minio."mcp-reports"."mcp_parquet"
+
+        IMPORTANT: There is NO single flat table. Always use the correct proc-specific path below.
+
+        --- Virtual Table 1: proc=revenue ---
+        Path: minio."mcp-reports"."mcp_parquet"."proc=revenue"
         Columns:
-        - _meta_resort: VARCHAR - Resort name (PURGATORY, PAJARITO, SANDIA, WILLAMETTE, Sipapu, Nordic, Snowbowl)
-        - _meta_proc: VARCHAR - Process type (budget)
-        - _meta_date_start: VARCHAR - Start date (YYYY-MM-DD format)
-        - _meta_date_end: VARCHAR - End date (YYYY-MM-DD format)
-        - _meta_run_id: VARCHAR - Run ID timestamp
-        - DepartmentTitle: VARCHAR - Department name (Lift Operations, Ski Patrol, Tickets, IT Services, Marketing, etc.)
-        - Type: VARCHAR - Type of data (Payroll, Revenue, Visits)
-        - Amount: DECIMAL(7,2) - Dollar amount or count value
-        - department: VARCHAR - Department code
-        - deptcode: INTEGER - Department code number
+        - _meta_resort: VARCHAR - Resort name (snowbowl, brian, lee-canyon, purgatory, sipapu, spider, sandia, nordic, willamette, pajarito)
+        - _meta_date: VARCHAR - Date (YYYY-MM-DD format)
+        - DepartmentTitle: VARCHAR - Department name
+        - revenue: DECIMAL - Actual revenue amount
+
+        --- Virtual Table 2: proc=budget ---
+        Path: minio."mcp-reports"."mcp_parquet"."proc=budget"
+        Columns:
+        - _meta_resort: VARCHAR - Resort name
+        - _meta_date: VARCHAR - Date (YYYY-MM-DD format)
+        - DepartmentTitle: VARCHAR - Department name
+        - Amount: DECIMAL - Budgeted dollar amount
+        - Type: VARCHAR - Budget category (Payroll, Revenue, Visits)
+
+        --- Virtual Table 3: proc=weather ---
+        Path: minio."mcp-reports"."mcp_parquet"."proc=weather"
+        Columns:
+        - _meta_resort: VARCHAR - Resort name
+        - _meta_date: VARCHAR - Date (YYYY-MM-DD format)
+        - date: VARCHAR - Date field
+        - snow_24hrs: DECIMAL - Snowfall in last 24 hours (inches)
+        - base_depth: DECIMAL - Snow base depth (inches)
+
+        --- Virtual Table 4: proc=visits ---
+        Path: minio."mcp-reports"."mcp_parquet"."proc=visits"
+        Columns:
+        - _meta_resort: VARCHAR - Resort name
+        - _meta_date: VARCHAR - Date (YYYY-MM-DD format)
+        - Location: VARCHAR - Visitor entry point or location
+        - Visits: INTEGER - Number of visits
+
+        --- Virtual Table 5: proc=processed_payroll ---
+        Path: minio."mcp-reports"."mcp_parquet"."proc=processed_payroll"
+        Columns:
+        - _meta_resort: VARCHAR - Resort name
+        - _meta_date: VARCHAR - Date (YYYY-MM-DD format)
+        - departmentTitle: VARCHAR - Department name (note: lowercase 'd')
+        - payroll: DECIMAL - Actual processed payroll amount
+
+        --- Join Rules ---
+        - Cross-proc queries (e.g. revenue vs budget/payroll) require explicit JOINs on DepartmentTitle AND _meta_date
+        - Always alias tables when joining: e.g. ... AS revenue JOIN ... AS payroll
+        - Winter season = November 1 to March 31
+        - _meta_date is VARCHAR — use CAST(_meta_date AS DATE) for range comparisons
+        - Use date_trunc() for week/month bucketing
+        - Use current_date for today's date
+        - Resort names are kebab case.
         """
 
         # Add DDL to ChromaDB if not exists
@@ -190,45 +232,200 @@ class VannaNLToSQL:
 
         # Add example SQL queries
         examples = [
-            {
-                "question": "What is the total budget for Purgatory resort?",
-                "sql": """SELECT _meta_resort, Type, SUM(Amount) as total 
-                         FROM minio."mcp-reports-test".mcp_parquet 
-                         WHERE UPPER(_meta_resort) = 'PURGATORY' 
-                         GROUP BY _meta_resort, Type""",
-            },
-            {
-                "question": "Show payroll by department for Sandia",
-                "sql": """SELECT DepartmentTitle, SUM(Amount) as total_payroll 
-                         FROM minio."mcp-reports-test".mcp_parquet 
-                         WHERE UPPER(_meta_resort) = 'SANDIA' AND Type = 'Payroll' 
-                         GROUP BY DepartmentTitle 
-                         ORDER BY total_payroll DESC""",
-            },
-            {
-                "question": "What is the revenue for all resorts?",
-                "sql": """SELECT _meta_resort, SUM(Amount) as total_revenue 
-                         FROM minio."mcp-reports-test".mcp_parquet 
-                         WHERE Type = 'Revenue' 
-                         GROUP BY _meta_resort 
-                         ORDER BY total_revenue DESC""",
-            },
-            {
-                "question": "How many visits for each resort?",
-                "sql": """SELECT _meta_resort, SUM(Amount) as total_visits 
-                         FROM minio."mcp-reports-test".mcp_parquet 
-                         WHERE Type = 'Visits' 
-                         GROUP BY _meta_resort""",
-            },
-            {
-                "question": "Show budget for the last 7 days",
-                "sql": """SELECT _meta_resort, Type, _meta_date_start, SUM(Amount) as total 
-                         FROM minio."mcp-reports-test".mcp_parquet 
-                         WHERE CAST(_meta_date_start AS DATE) >= CURRENT_DATE - INTERVAL '7' DAY 
-                         GROUP BY _meta_resort, Type, _meta_date_start 
-                         ORDER BY _meta_date_start DESC""",
-            },
-        ]
+    {
+        "question": "Give me the Budgeted Revenue of Snowbowl for 1st Feb, 2026.",
+        "sql": """SELECT "DepartmentTitle", "Amount"
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=budget"
+                  WHERE "_meta_resort"='snowbowl'
+                  AND "_meta_date"='2026-02-01'
+                  AND "Type"='Revenue'""",
+    },
+    {
+        "question": "Give me the Budget for the visits of Snowbowl for 1st Feb, 2026.",
+        "sql": """SELECT "DepartmentTitle", "Amount"
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=budget"
+                  WHERE "_meta_resort"='snowbowl'
+                  AND "_meta_date"='2026-02-01'
+                  AND "Type"='Visits'""",
+    },
+    {
+        "question": "What is the revenue of Snowbowl for the month?",
+        "sql": """SELECT "DepartmentTitle", SUM(revenue) AS TotalRevenue
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue"
+                  WHERE "_meta_resort"='snowbowl'
+                  AND "_meta_date" BETWEEN date_trunc('month', current_date) AND current_date
+                  GROUP BY "DepartmentTitle" """,
+    },
+    {
+        "question": "Give me the labour budget of Snowbowl for 1st Feb, 2026.",
+        "sql": """SELECT "DepartmentTitle", "Amount"
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=budget"
+                  WHERE "_meta_resort"='snowbowl'
+                  AND "_meta_date"='2026-02-01'
+                  AND "Type"='Payroll'""",
+    },
+    {
+        "question": "How much snow and base depth did Snowbowl have on 21st Feb, 2026?",
+        "sql": """SELECT SUM("snow_24hrs") AS Snow, SUM("base_depth") AS BaseDepth
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=weather"
+                  WHERE "_meta_resort"='snowbowl'
+                  AND "_meta_date"='2026-02-21'""",
+    },
+    {
+        "question": "What were the visits at Snowbowl on 02/21/26?",
+        "sql": """SELECT Location, SUM(Visits) AS Visits
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=visits"
+                  WHERE "_meta_resort"='snowbowl'
+                  AND "_meta_date" = '2026-02-21'
+                  GROUP BY Location""",
+    },
+    {
+        "question": "Tell me about the labour of Snowbowl on 2026-02-22.",
+        "sql": """SELECT "departmentTitle", "payroll"
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=processed_payroll"
+                  WHERE "_meta_resort"='snowbowl'
+                  AND "_meta_date"='2026-02-22'""",
+    },
+    {
+        "question": "Give me the revenue to payroll ratio of Snowbowl for 6th Feb, 2026.",
+        "sql": """SELECT revenue.DepartmentTitle,
+                          SUM(revenue.revenue) AS TotalRevenue,
+                          SUM(processed_payroll.payroll) AS TotalPayroll,
+                          (SUM(revenue.revenue) / SUM(processed_payroll.payroll)) AS RevenueToPayrollRatio
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
+                  JOIN minio."mcp-reports"."mcp_parquet"."proc=processed_payroll" AS processed_payroll
+                      ON revenue.DepartmentTitle = processed_payroll.departmentTitle
+                      AND revenue."_meta_date" = processed_payroll."_meta_date"
+                  WHERE revenue."_meta_resort"='snowbowl'
+                    AND revenue."_meta_date"='2026-02-06'
+                    AND processed_payroll."_meta_resort"='snowbowl'
+                  GROUP BY revenue.DepartmentTitle""",
+    },
+    {
+        "question": "Provide the labour to revenue ratio of Snowbowl for the Winter season 2025.",
+        "sql": """SELECT revenue."_meta_date",
+                          SUM(revenue.revenue) AS TotalRevenue,
+                          SUM(processed_payroll.payroll) AS TotalPayroll,
+                          (SUM(processed_payroll.payroll) / SUM(revenue.revenue)) AS PayrollToRevenueRatio
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
+                  JOIN minio."mcp-reports"."mcp_parquet"."proc=processed_payroll" AS processed_payroll
+                      ON revenue.DepartmentTitle = processed_payroll.departmentTitle
+                      AND revenue."_meta_date" = processed_payroll."_meta_date"
+                  WHERE revenue."_meta_resort"='snowbowl'
+                    AND revenue."_meta_date" BETWEEN '2025-11-01' AND '2026-03-31'
+                    AND processed_payroll."_meta_resort"='snowbowl'
+                  GROUP BY revenue."_meta_date"
+                  ORDER BY revenue."_meta_date""",
+    },
+    {
+        "question": "Show me the payroll to revenue variance for Snowbowl on 20th Feb, 2026.",
+        "sql": """SELECT revenue."DepartmentTitle",
+                          SUM(revenue.revenue) AS TotalRevenue,
+                          SUM(processed_payroll.payroll) AS TotalPayroll,
+                          (SUM(processed_payroll.payroll) - SUM(revenue.revenue)) AS PayrollRevenueVariance
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
+                  JOIN minio."mcp-reports"."mcp_parquet"."proc=processed_payroll" AS processed_payroll
+                      ON revenue.DepartmentTitle = processed_payroll.departmentTitle
+                      AND revenue."_meta_date" = processed_payroll."_meta_date"
+                  WHERE revenue."_meta_resort"='snowbowl'
+                    AND revenue."_meta_date"='2026-02-20'
+                    AND processed_payroll."_meta_resort"='snowbowl'
+                  GROUP BY revenue.DepartmentTitle""",
+    },
+    {
+        "question": "Compare the labour to revenue variance for Snowbowl between 15th Feb and 21st Feb, 2026.",
+        "sql": """SELECT revenue."_meta_date",
+                          SUM(revenue.revenue) AS TotalRevenue,
+                          SUM(processed_payroll.payroll) AS TotalPayroll,
+                          (SUM(processed_payroll.payroll) - SUM(revenue.revenue)) AS PayrollRevenueVariance
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
+                  JOIN minio."mcp-reports"."mcp_parquet"."proc=processed_payroll" AS processed_payroll
+                      ON revenue.DepartmentTitle = processed_payroll.departmentTitle
+                      AND revenue."_meta_date" = processed_payroll."_meta_date"
+                  WHERE revenue."_meta_resort"='snowbowl'
+                    AND revenue."_meta_date" BETWEEN '2026-02-15' AND '2026-02-21'
+                    AND processed_payroll."_meta_resort"='snowbowl'
+                  GROUP BY revenue."_meta_date"
+                  ORDER BY revenue."_meta_date""",
+    },
+    {
+        "question": "Compare last week revenue with the current week for Snowbowl.",
+        "sql": """WITH current_week AS (
+                      SELECT SUM(revenue) AS TotalRevenue
+                      FROM minio."mcp-reports"."mcp_parquet"."proc=revenue"
+                      WHERE "_meta_resort"='snowbowl'
+                        AND "_meta_date" BETWEEN date_trunc('week', current_date) AND current_date
+                  ),
+                  prior_week AS (
+                      SELECT SUM(revenue) AS TotalRevenue
+                      FROM minio."mcp-reports"."mcp_parquet"."proc=revenue"
+                      WHERE "_meta_resort"='snowbowl'
+                        AND "_meta_date" BETWEEN date_trunc('week', current_date) - interval '7 days'
+                        AND current_date - interval '7 days'
+                  )
+                  SELECT current_week.TotalRevenue AS CurrentWeekRevenue,
+                         prior_week.TotalRevenue AS PriorWeekRevenue,
+                         (current_week.TotalRevenue - prior_week.TotalRevenue) AS RevenueDifference
+                  FROM current_week, prior_week""",
+    },
+    {
+        "question": "Show labour to revenue ratio for Snowbowl this month.",
+        "sql": """SELECT revenue."_meta_date",
+                          SUM(revenue.revenue) AS TotalRevenue,
+                          SUM(payroll.Amount) AS TotalPayroll,
+                          (SUM(revenue.revenue)/SUM(payroll.Amount)) AS RevenueToPayrollRatio
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
+                  JOIN minio."mcp-reports"."mcp_parquet"."proc=budget" AS payroll
+                      ON revenue."DepartmentTitle" = payroll."DepartmentTitle"
+                      AND revenue."_meta_date" = payroll."_meta_date"
+                  WHERE revenue."_meta_resort"='snowbowl'
+                    AND revenue."_meta_date" BETWEEN date_trunc('month', current_date) AND current_date
+                    AND payroll."_meta_resort"='snowbowl'
+                    AND payroll."Type"='Payroll'
+                  GROUP BY revenue."_meta_date"
+                  ORDER BY revenue."_meta_date""",
+    },
+    {
+        "question": "Provide revenue to Labour ratio for current Winter season.",
+        "sql": """SELECT 
+                          SUM(revenue.revenue) AS TotalRevenue,
+                          SUM(processed_payroll.payroll) AS TotalPayroll,
+                          SUM(revenue.revenue) / NULLIF(SUM(processed_payroll.payroll), 0) AS RevenueToPayrollRatio
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
+                  JOIN minio."mcp-reports"."mcp_parquet"."proc=processed_payroll" AS processed_payroll
+                      ON revenue."DepartmentTitle" = processed_payroll."departmentTitle"
+                      AND revenue."_meta_date" = processed_payroll."_meta_date"
+                  WHERE revenue."_meta_resort" = 'snowbowl'
+                  AND revenue."_meta_date" BETWEEN 
+                      CASE 
+                          WHEN EXTRACT(MONTH FROM CURRENT_DATE) BETWEEN 1 AND 3 THEN
+                              DATE '2025-11-25'
+                          WHEN EXTRACT(MONTH FROM CURRENT_DATE) BETWEEN 4 AND 9 THEN
+                              DATE '2025-11-25'
+                          ELSE
+                              DATE '2026-11-25'
+                      END
+                      AND CURRENT_DATE
+                  AND processed_payroll."_meta_resort" = 'snowbowl'""",
+    },
+    {
+        "question": "Provide revenue for current Winter season.",
+        "sql": """SELECT 
+                          SUM(revenue.revenue) AS TotalRevenue
+                  FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
+                  WHERE revenue."_meta_resort" = 'snowbowl'
+                  AND revenue."_meta_date" BETWEEN 
+                      CASE 
+                          WHEN EXTRACT(MONTH FROM CURRENT_DATE) BETWEEN 1 AND 3 THEN 
+                              DATE '2025-11-25' 
+                          WHEN EXTRACT(MONTH FROM CURRENT_DATE) BETWEEN 4 AND 9 THEN 
+                              DATE '2025-11-25' 
+                          ELSE 
+                              DATE '2026-11-25' 
+                      END
+                      AND CURRENT_DATE""",
+    }
+]
 
         for i, ex in enumerate(examples):
             ex_id = f"example_{i}"
@@ -242,23 +439,25 @@ class VannaNLToSQL:
 
         # Add documentation
         doc = """
-        This database contains ski resort budget data from MinIO storage.
-        
-        Available resorts: PURGATORY, PAJARITO, SANDIA, WILLAMETTE, Sipapu, Nordic, Snowbowl
-        
-        Data types:
-        - Payroll: Staff salary and labor costs by department
-        - Revenue: Income from tickets, retail, food service, ski school, rentals
-        - Visits: Number of visitors (daily tickets, season passes, comp tickets)
-        
+        This database contains ski resort operational data from MinIO storage.
+
+        Available resorts (always use exact lowercase kebab-case): snowbowl, brian, lee-canyon, purgatory, sipapu, spider, sandia, nordic, willamette, pajarito
+
+        Data types by proc:
+        - proc=revenue: Actual daily revenue by department
+        - proc=budget: Planned budget amounts (Payroll, Revenue, Visits types)
+        - proc=processed_payroll: Actual processed payroll by department (also called "labour")
+        - proc=visits: Daily visitor counts by location/entry point
+        - proc=weather: Daily snow conditions (snow_24hrs, base_depth)
+
         Common departments:
         - Lift Operations, Ski Patrol, Tickets, IT Services, Marketing
         - Mountain G&A, General Administration, Executive
         - Ski School, Rentals, Facilities Maintenance
         - Retail, Cafe/Food service
-        
-        Date fields are in VARCHAR format (YYYY-MM-DD), use CAST for date comparisons.
-        Resort names may be uppercase or mixed case - use UPPER() for comparisons.
+
+        Date field is _meta_date (VARCHAR, YYYY-MM-DD). Use CAST(_meta_date AS DATE) for range comparisons.
+        Resort names are always lowercase kebab-case. Never use UPPER().
         """
 
         existing = self.doc_collection.get(ids=["main_doc"])
@@ -297,13 +496,21 @@ class VannaNLToSQL:
         system_prompt = """You are an expert SQL analyst for Dremio. Generate SQL queries based on user questions.
 
 IMPORTANT RULES:
-1. ALWAYS use the full table path: minio."mcp-reports-test".mcp_parquet
-2. Resort names may be mixed case - use UPPER(_meta_resort) for comparisons
-3. Date fields (_meta_date_start, _meta_date_end) are VARCHAR - use CAST for date operations
-4. Return ONLY the SQL query, no explanations
-5. Use proper Dremio SQL syntax
-
-Available columns: _meta_resort, _meta_proc, _meta_date_start, _meta_date_end, DepartmentTitle, Type, Amount, department, deptcode"""
+1. Data is stored as partitioned Parquet files. Each process type is a SEPARATE virtual table — never query a single flat table.
+2. Always use the correct proc-specific path:
+   - Actual revenue:      minio."mcp-reports"."mcp_parquet"."proc=revenue"
+   - Budget (planned):    minio."mcp-reports"."mcp_parquet"."proc=budget"
+   - Weather:             minio."mcp-reports"."mcp_parquet"."proc=weather"
+   - Visits/ticketing:    minio."mcp-reports"."mcp_parquet"."proc=visits"
+   - Processed payroll:   minio."mcp-reports"."mcp_parquet"."proc=processed_payroll"
+3. Resort names are lowercase kebab-case (e.g. 'snowbowl', 'lee-canyon', 'purgatory'). Never use UPPER().
+4. The date field is _meta_date (VARCHAR, YYYY-MM-DD). Use CAST(_meta_date AS DATE) for range comparisons.
+5. For cross-proc queries, JOIN on DepartmentTitle AND _meta_date, and always alias each table.
+6. "Labour" and "payroll" refer to the same concept — use proc=processed_payroll for actuals, proc=budget with Type='Payroll' for budget.
+7. Winter season = November 1 to March 31.
+8. Use date_trunc() for week/month bucketing. Use current_date for today.
+9. Return ONLY the SQL query, no explanations or markdown fences.
+10. Use proper Dremio SQL syntax."""
 
         user_prompt = f"""Context:
 {context}
