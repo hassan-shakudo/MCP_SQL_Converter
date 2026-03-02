@@ -82,60 +82,69 @@ class DremioClient:
         }
 
     def execute_sql(self, sql: str) -> pd.DataFrame:
-        """Execute SQL query and return DataFrame"""
-        if not self.token:
-            self.login()
-
-        try:
-            # Submit job
-            response = self.client.post(
-                f"{self.base_url}/api/v3/sql",
-                headers=self._get_headers(),
-                json={"sql": sql},
-            )
-            response.raise_for_status()
-            job_data = response.json()
-            job_id = job_data.get("id")
-
-            # Poll for job completion
-            max_attempts = 60
-            for _ in range(max_attempts):
-                status_response = self.client.get(
-                    f"{self.base_url}/api/v3/job/{job_id}", headers=self._get_headers()
+        """Execute SQL query and return DataFrame, with automatic token refresh on 401"""
+        for attempt in range(2):
+            if not self.token:
+                if not self.login():
+                    raise Exception("Failed to authenticate with Dremio")
+            try:
+                # Submit job
+                response = self.client.post(
+                    f"{self.base_url}/api/v3/sql",
+                    headers=self._get_headers(),
+                    json={"sql": sql},
                 )
-                status_response.raise_for_status()
-                status_data = status_response.json()
-                job_state = status_data.get("jobState")
+                response.raise_for_status()
+                job_data = response.json()
+                job_id = job_data.get("id")
 
-                if job_state == "COMPLETED":
-                    break
-                elif job_state in ["FAILED", "CANCELED"]:
-                    error_msg = status_data.get("errorMessage", "Unknown error")
-                    raise Exception(f"Query failed: {error_msg}")
+                # Poll for job completion
+                max_attempts = 60
+                for _ in range(max_attempts):
+                    status_response = self.client.get(
+                        f"{self.base_url}/api/v3/job/{job_id}", headers=self._get_headers()
+                    )
+                    status_response.raise_for_status()
+                    status_data = status_response.json()
+                    job_state = status_data.get("jobState")
 
-                time.sleep(0.5)
-            else:
-                raise Exception("Query timeout")
+                    if job_state == "COMPLETED":
+                        break
+                    elif job_state in ["FAILED", "CANCELED"]:
+                        error_msg = status_data.get("errorMessage", "Unknown error")
+                        raise Exception(f"Query failed: {error_msg}")
 
-            # Get results
-            results_response = self.client.get(
-                f"{self.base_url}/api/v3/job/{job_id}/results",
-                headers=self._get_headers(),
-                params={"offset": 0, "limit": 500},
-            )
-            results_response.raise_for_status()
-            results_data = results_response.json()
+                    time.sleep(0.5)
+                else:
+                    raise Exception("Query timeout")
 
-            # Convert to DataFrame
-            rows = results_data.get("rows", [])
-            if rows:
-                df = pd.DataFrame(rows)
-                return df
-            return pd.DataFrame()
+                # Get results
+                results_response = self.client.get(
+                    f"{self.base_url}/api/v3/job/{job_id}/results",
+                    headers=self._get_headers(),
+                    params={"offset": 0, "limit": 500},
+                )
+                results_response.raise_for_status()
+                results_data = results_response.json()
 
-        except Exception as e:
-            logger.error(f"Error executing SQL: {e}")
-            raise
+                # Convert to DataFrame
+                rows = results_data.get("rows", [])
+                if rows:
+                    return pd.DataFrame(rows)
+                return pd.DataFrame()
+
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401 and attempt == 0:
+                    logger.warning("Dremio token expired, re-authenticating...")
+                    self.token = None
+                    continue
+                logger.error(f"Error executing SQL: {e}")
+                raise
+            except Exception as e:
+                logger.error(f"Error executing SQL: {e}")
+                raise
+
+        raise Exception("Failed to execute SQL after re-authentication")
 
 
 # =============================================================================
