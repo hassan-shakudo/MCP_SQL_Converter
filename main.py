@@ -7,12 +7,14 @@ import os
 import json
 import time
 import uuid
+import hashlib
 import logging
-from typing import List, Optional, Dict, Any, AsyncGenerator
+from typing import List, Optional, Dict, Any, AsyncGenerator, Tuple
 from contextlib import asynccontextmanager
 
 import httpx
 import pandas as pd
+import sqlparse
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,7 +43,97 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
 CHROMA_PATH = os.getenv("CHROMA_PATH", "/tmp/chroma_db")
 
+# SQL Cache Configuration
+CACHE_SIMILARITY_THRESHOLD = float(
+    os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.05")
+)  # cosine distance < 0.05 = similarity > 0.95
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "true").lower() == "true"
+
 TABLE_BASE = 'minio."mcp-reports"."mcp_parquet"'
+
+
+# =============================================================================
+# SQL Cache Utilities
+# =============================================================================
+
+
+def normalize_sql(sql: str) -> str:
+    """
+    Normalize SQL for consistent hashing and deduplication.
+
+    Handles:
+    - Whitespace normalization
+    - Keyword case normalization (uppercase)
+    - Comment removal
+    - Consistent formatting
+
+    Args:
+        sql: Raw SQL string
+
+    Returns:
+        Normalized SQL string suitable for hashing
+    """
+    if not sql or not sql.strip():
+        return ""
+
+    try:
+        # Use sqlparse for robust SQL normalization
+        normalized = sqlparse.format(
+            sql,
+            keyword_case="upper",  # SELECT, FROM, WHERE -> uppercase
+            identifier_case=None,  # Keep identifier case (table/column names)
+            strip_comments=True,  # Remove -- and /* */ comments
+            strip_whitespace=True,  # Remove extra whitespace
+            reindent=False,  # Don't change indentation structure
+        )
+        # Additional whitespace normalization: collapse all whitespace to single spaces
+        return " ".join(normalized.split())
+    except Exception as e:
+        # Fallback: basic normalization if sqlparse fails
+        logger.warning(f"SQL normalization fallback due to: {e}")
+        return " ".join(sql.upper().split())
+
+
+def hash_string(s: str) -> str:
+    """
+    Generate a SHA-256 hash of a string.
+
+    Args:
+        s: Input string
+
+    Returns:
+        Hexadecimal hash string
+    """
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def question_hash(question: str) -> str:
+    """
+    Generate hash for exact question matching (Level 1 cache).
+
+    Args:
+        question: User's question
+
+    Returns:
+        Hash of the lowercased, whitespace-normalized question
+    """
+    # Normalize: lowercase and collapse whitespace for exact matching
+    normalized = " ".join(question.lower().split())
+    return hash_string(normalized)
+
+
+def sql_hash(sql: str) -> str:
+    """
+    Generate hash for SQL deduplication.
+
+    Args:
+        sql: SQL query
+
+    Returns:
+        Hash of the normalized SQL
+    """
+    return hash_string(normalize_sql(sql))
+
 
 # =============================================================================
 # Dremio Client
@@ -102,7 +194,8 @@ class DremioClient:
                 max_attempts = 60
                 for _ in range(max_attempts):
                     status_response = self.client.get(
-                        f"{self.base_url}/api/v3/job/{job_id}", headers=self._get_headers()
+                        f"{self.base_url}/api/v3/job/{job_id}",
+                        headers=self._get_headers(),
                     )
                     status_response.raise_for_status()
                     status_data = status_response.json()
@@ -153,12 +246,14 @@ class DremioClient:
 
 
 class VannaNLToSQL:
-    """Custom NL-to-SQL engine using OpenAI and ChromaDB"""
+    """Custom NL-to-SQL engine using OpenAI and ChromaDB with SQL caching"""
 
     def __init__(self, dremio_client: DremioClient):
         self.dremio = dremio_client
         self.openai = OpenAI(api_key=OPENAI_API_KEY)
         self.model = OPENAI_MODEL
+        self.cache_enabled = CACHE_ENABLED
+        self.cache_similarity_threshold = CACHE_SIMILARITY_THRESHOLD
 
         # Initialize ChromaDB
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -169,6 +264,20 @@ class VannaNLToSQL:
         self.doc_collection = self.chroma_client.get_or_create_collection(
             "documentation"
         )
+
+        # Initialize SQL cache collection
+        # Uses ChromaDB's default embedding function for semantic similarity
+        self.query_cache = self.chroma_client.get_or_create_collection(
+            name="query_cache",
+            metadata={"hnsw:space": "cosine"},  # cosine distance for semantic matching
+        )
+
+        logger.info(
+            f"SQL Cache initialized (enabled={self.cache_enabled}, threshold={self.cache_similarity_threshold})"
+        )
+        cache_count = self.query_cache.count()
+        if cache_count > 0:
+            logger.info(f"Loaded {cache_count} cached queries from persistent storage")
 
         # Train on schema
         self._train_on_schema()
@@ -241,63 +350,63 @@ class VannaNLToSQL:
 
         # Add example SQL queries
         examples = [
-    {
-        "question": "Give me the Budgeted Revenue of Snowbowl for 1st Feb, 2026.",
-        "sql": """SELECT "DepartmentTitle", "Amount"
+            {
+                "question": "Give me the Budgeted Revenue of Snowbowl for 1st Feb, 2026.",
+                "sql": """SELECT "DepartmentTitle", "Amount"
                   FROM minio."mcp-reports"."mcp_parquet"."proc=budget"
                   WHERE "_meta_resort"='snowbowl'
                   AND "_meta_date"='2026-02-01'
                   AND "Type"='Revenue'""",
-    },
-    {
-        "question": "Give me the Budget for the visits of Snowbowl for 1st Feb, 2026.",
-        "sql": """SELECT "DepartmentTitle", "Amount"
+            },
+            {
+                "question": "Give me the Budget for the visits of Snowbowl for 1st Feb, 2026.",
+                "sql": """SELECT "DepartmentTitle", "Amount"
                   FROM minio."mcp-reports"."mcp_parquet"."proc=budget"
                   WHERE "_meta_resort"='snowbowl'
                   AND "_meta_date"='2026-02-01'
                   AND "Type"='Visits'""",
-    },
-    {
-        "question": "What is the revenue of Snowbowl for the month?",
-        "sql": """SELECT "DepartmentTitle", SUM(revenue) AS TotalRevenue
+            },
+            {
+                "question": "What is the revenue of Snowbowl for the month?",
+                "sql": """SELECT "DepartmentTitle", SUM(revenue) AS TotalRevenue
                   FROM minio."mcp-reports"."mcp_parquet"."proc=revenue"
                   WHERE "_meta_resort"='snowbowl'
                   AND "_meta_date" BETWEEN date_trunc('month', current_date) AND current_date
                   GROUP BY "DepartmentTitle" """,
-    },
-    {
-        "question": "Give me the labour budget of Snowbowl for 1st Feb, 2026.",
-        "sql": """SELECT "DepartmentTitle", "Amount"
+            },
+            {
+                "question": "Give me the labour budget of Snowbowl for 1st Feb, 2026.",
+                "sql": """SELECT "DepartmentTitle", "Amount"
                   FROM minio."mcp-reports"."mcp_parquet"."proc=budget"
                   WHERE "_meta_resort"='snowbowl'
                   AND "_meta_date"='2026-02-01'
                   AND "Type"='Payroll'""",
-    },
-    {
-        "question": "How much snow and base depth did Snowbowl have on 21st Feb, 2026?",
-        "sql": """SELECT SUM("snow_24hrs") AS Snow, SUM("base_depth") AS BaseDepth
+            },
+            {
+                "question": "How much snow and base depth did Snowbowl have on 21st Feb, 2026?",
+                "sql": """SELECT SUM("snow_24hrs") AS Snow, SUM("base_depth") AS BaseDepth
                   FROM minio."mcp-reports"."mcp_parquet"."proc=weather"
                   WHERE "_meta_resort"='snowbowl'
                   AND "_meta_date"='2026-02-21'""",
-    },
-    {
-        "question": "What were the visits at Snowbowl on 02/21/26?",
-        "sql": """SELECT Location, SUM(Visits) AS Visits
+            },
+            {
+                "question": "What were the visits at Snowbowl on 02/21/26?",
+                "sql": """SELECT Location, SUM(Visits) AS Visits
                   FROM minio."mcp-reports"."mcp_parquet"."proc=visits"
                   WHERE "_meta_resort"='snowbowl'
                   AND "_meta_date" = '2026-02-21'
                   GROUP BY Location""",
-    },
-    {
-        "question": "Tell me about the labour of Snowbowl on 2026-02-22.",
-        "sql": """SELECT "departmentTitle", "payroll"
+            },
+            {
+                "question": "Tell me about the labour of Snowbowl on 2026-02-22.",
+                "sql": """SELECT "departmentTitle", "payroll"
                   FROM minio."mcp-reports"."mcp_parquet"."proc=processed_payroll"
                   WHERE "_meta_resort"='snowbowl'
                   AND "_meta_date"='2026-02-22'""",
-    },
-    {
-        "question": "Give me the revenue to payroll ratio of Snowbowl for 6th Feb, 2026.",
-        "sql": """SELECT revenue.DepartmentTitle,
+            },
+            {
+                "question": "Give me the revenue to payroll ratio of Snowbowl for 6th Feb, 2026.",
+                "sql": """SELECT revenue.DepartmentTitle,
                           SUM(revenue.revenue) AS TotalRevenue,
                           SUM(processed_payroll.payroll) AS TotalPayroll,
                           (SUM(revenue.revenue) / SUM(processed_payroll.payroll)) AS RevenueToPayrollRatio
@@ -309,10 +418,10 @@ class VannaNLToSQL:
                     AND revenue."_meta_date"='2026-02-06'
                     AND processed_payroll."_meta_resort"='snowbowl'
                   GROUP BY revenue.DepartmentTitle""",
-    },
-    {
-        "question": "Provide the labour to revenue ratio of Snowbowl for the Winter season 2025.",
-        "sql": """SELECT revenue."_meta_date",
+            },
+            {
+                "question": "Provide the labour to revenue ratio of Snowbowl for the Winter season 2025.",
+                "sql": """SELECT revenue."_meta_date",
                           SUM(revenue.revenue) AS TotalRevenue,
                           SUM(processed_payroll.payroll) AS TotalPayroll,
                           (SUM(processed_payroll.payroll) / SUM(revenue.revenue)) AS PayrollToRevenueRatio
@@ -325,10 +434,10 @@ class VannaNLToSQL:
                     AND processed_payroll."_meta_resort"='snowbowl'
                   GROUP BY revenue."_meta_date"
                   ORDER BY revenue."_meta_date""",
-    },
-    {
-        "question": "Show me the payroll to revenue variance for Snowbowl on 20th Feb, 2026.",
-        "sql": """SELECT revenue."DepartmentTitle",
+            },
+            {
+                "question": "Show me the payroll to revenue variance for Snowbowl on 20th Feb, 2026.",
+                "sql": """SELECT revenue."DepartmentTitle",
                           SUM(revenue.revenue) AS TotalRevenue,
                           SUM(processed_payroll.payroll) AS TotalPayroll,
                           (SUM(processed_payroll.payroll) - SUM(revenue.revenue)) AS PayrollRevenueVariance
@@ -340,10 +449,10 @@ class VannaNLToSQL:
                     AND revenue."_meta_date"='2026-02-20'
                     AND processed_payroll."_meta_resort"='snowbowl'
                   GROUP BY revenue.DepartmentTitle""",
-    },
-    {
-        "question": "Compare the labour to revenue variance for Snowbowl between 15th Feb and 21st Feb, 2026.",
-        "sql": """SELECT revenue."_meta_date",
+            },
+            {
+                "question": "Compare the labour to revenue variance for Snowbowl between 15th Feb and 21st Feb, 2026.",
+                "sql": """SELECT revenue."_meta_date",
                           SUM(revenue.revenue) AS TotalRevenue,
                           SUM(processed_payroll.payroll) AS TotalPayroll,
                           (SUM(processed_payroll.payroll) - SUM(revenue.revenue)) AS PayrollRevenueVariance
@@ -356,10 +465,10 @@ class VannaNLToSQL:
                     AND processed_payroll."_meta_resort"='snowbowl'
                   GROUP BY revenue."_meta_date"
                   ORDER BY revenue."_meta_date""",
-    },
-    {
-        "question": "Compare last week revenue with the current week for Snowbowl.",
-        "sql": """WITH current_week AS (
+            },
+            {
+                "question": "Compare last week revenue with the current week for Snowbowl.",
+                "sql": """WITH current_week AS (
                       SELECT SUM(revenue) AS TotalRevenue
                       FROM minio."mcp-reports"."mcp_parquet"."proc=revenue"
                       WHERE "_meta_resort"='snowbowl'
@@ -376,10 +485,10 @@ class VannaNLToSQL:
                          prior_week.TotalRevenue AS PriorWeekRevenue,
                          (current_week.TotalRevenue - prior_week.TotalRevenue) AS RevenueDifference
                   FROM current_week, prior_week""",
-    },
-    {
-        "question": "Show labour to revenue ratio for Snowbowl this month.",
-        "sql": """SELECT revenue."_meta_date",
+            },
+            {
+                "question": "Show labour to revenue ratio for Snowbowl this month.",
+                "sql": """SELECT revenue."_meta_date",
                           SUM(revenue.revenue) AS TotalRevenue,
                           SUM(payroll.Amount) AS TotalPayroll,
                           (SUM(revenue.revenue)/SUM(payroll.Amount)) AS RevenueToPayrollRatio
@@ -393,10 +502,10 @@ class VannaNLToSQL:
                     AND payroll."Type"='Payroll'
                   GROUP BY revenue."_meta_date"
                   ORDER BY revenue."_meta_date""",
-    },
-    {
-        "question": "Provide revenue to Labour ratio for current Winter season.",
-        "sql": """SELECT 
+            },
+            {
+                "question": "Provide revenue to Labour ratio for current Winter season.",
+                "sql": """SELECT 
                           SUM(revenue.revenue) AS TotalRevenue,
                           SUM(processed_payroll.payroll) AS TotalPayroll,
                           SUM(revenue.revenue) / NULLIF(SUM(processed_payroll.payroll), 0) AS RevenueToPayrollRatio
@@ -416,10 +525,10 @@ class VannaNLToSQL:
                       END
                       AND CURRENT_DATE
                   AND processed_payroll."_meta_resort" = 'snowbowl'""",
-    },
-    {
-        "question": "Provide revenue for current Winter season.",
-        "sql": """SELECT 
+            },
+            {
+                "question": "Provide revenue for current Winter season.",
+                "sql": """SELECT 
                           SUM(revenue.revenue) AS TotalRevenue
                   FROM minio."mcp-reports"."mcp_parquet"."proc=revenue" AS revenue
                   WHERE revenue."_meta_resort" = 'snowbowl'
@@ -433,8 +542,8 @@ class VannaNLToSQL:
                               DATE '2026-11-25' 
                       END
                       AND CURRENT_DATE""",
-    }
-]
+            },
+        ]
 
         for i, ex in enumerate(examples):
             ex_id = f"example_{i}"
@@ -474,6 +583,211 @@ class VannaNLToSQL:
             self.doc_collection.add(documents=[doc], ids=["main_doc"])
 
         logger.info("Schema training complete")
+
+    # =========================================================================
+    # SQL Cache Methods
+    # =========================================================================
+
+    def _cache_lookup(self, question: str) -> Tuple[Optional[str], str]:
+        """
+        Look up question in SQL cache using two-level strategy:
+
+        Level 1 (L1): Exact match on question hash (fastest)
+        Level 3 (L3): Semantic similarity using embeddings (catches paraphrases)
+
+        Args:
+            question: User's natural language question
+
+        Returns:
+            Tuple of (cached_sql, cache_hit_type) where:
+            - cached_sql is the SQL string if found, None otherwise
+            - cache_hit_type is "exact", "semantic", or "miss"
+        """
+        if not self.cache_enabled:
+            logger.debug("Cache disabled, skipping lookup")
+            return None, "disabled"
+
+        try:
+            # Level 1: Exact question hash match (fastest path)
+            q_hash = question_hash(question)
+            exact_results = self.query_cache.get(
+                where={"question_hash": q_hash}, include=["metadatas"]
+            )
+
+            if exact_results and exact_results.get("ids"):
+                cached_sql = exact_results["metadatas"][0].get("sql")
+                if cached_sql:
+                    logger.info(f"[CACHE HIT - EXACT] Question hash: {q_hash[:16]}...")
+                    return cached_sql, "exact"
+
+            # Level 3: Semantic similarity search
+            # ChromaDB returns cosine distance (0 = identical, 2 = opposite)
+            # threshold 0.05 means similarity > 0.95
+            semantic_results = self.query_cache.query(
+                query_texts=[question],
+                n_results=1,
+                include=["metadatas", "distances", "documents"],
+            )
+
+            if (
+                semantic_results
+                and semantic_results.get("ids")
+                and semantic_results["ids"][0]
+                and semantic_results.get("distances")
+                and semantic_results["distances"][0]
+            ):
+                distance = semantic_results["distances"][0][0]
+
+                if distance < self.cache_similarity_threshold:
+                    cached_sql = semantic_results["metadatas"][0][0].get("sql")
+                    cached_question = (
+                        semantic_results["documents"][0][0]
+                        if semantic_results.get("documents")
+                        else "unknown"
+                    )
+
+                    if cached_sql:
+                        similarity = 1 - distance  # Convert distance to similarity
+                        logger.info(
+                            f"[CACHE HIT - SEMANTIC] Distance: {distance:.4f}, "
+                            f"Similarity: {similarity:.2%}, "
+                            f"Matched question: '{cached_question[:50]}...'"
+                        )
+                        return cached_sql, "semantic"
+                else:
+                    logger.debug(
+                        f"[CACHE MISS - SEMANTIC] Best distance: {distance:.4f} "
+                        f"(threshold: {self.cache_similarity_threshold})"
+                    )
+
+            logger.info(
+                f"[CACHE MISS] No match found for question: '{question[:50]}...'"
+            )
+            return None, "miss"
+
+        except Exception as e:
+            logger.error(f"Cache lookup error: {e}")
+            return None, "error"
+
+    def _cache_store(self, question: str, sql: str) -> bool:
+        """
+        Store question-SQL mapping in cache with deduplication.
+
+        Deduplication: If the normalized SQL already exists in cache from a
+        different question, we skip storing to avoid redundancy.
+
+        Args:
+            question: User's natural language question
+            sql: Generated SQL query
+
+        Returns:
+            True if stored successfully, False if deduplicated or error
+        """
+        if not self.cache_enabled:
+            return False
+
+        if not sql or not sql.strip():
+            logger.warning("Attempted to cache empty SQL, skipping")
+            return False
+
+        try:
+            q_hash = question_hash(question)
+            s_hash = sql_hash(sql)
+
+            # Check for SQL deduplication: same SQL from different question
+            existing_sql = self.query_cache.get(
+                where={"sql_hash": s_hash}, include=["metadatas", "documents"]
+            )
+
+            if existing_sql and existing_sql.get("ids"):
+                existing_question = (
+                    existing_sql["documents"][0]
+                    if existing_sql.get("documents")
+                    else "unknown"
+                )
+                logger.info(
+                    f"[CACHE DEDUP] SQL already cached from different question. "
+                    f"Existing: '{existing_question[:50]}...', "
+                    f"New: '{question[:50]}...'"
+                )
+                return False
+
+            # Check if this exact question already cached (shouldn't happen, but safety check)
+            existing_question_entry = self.query_cache.get(
+                where={"question_hash": q_hash}, include=["metadatas"]
+            )
+
+            if existing_question_entry and existing_question_entry.get("ids"):
+                logger.debug(f"Question already cached, skipping: {q_hash[:16]}...")
+                return False
+
+            # Generate unique ID for this cache entry
+            cache_id = f"cache_{q_hash[:16]}_{int(time.time())}"
+
+            # Store in cache
+            self.query_cache.add(
+                documents=[question],  # Question text for embedding/semantic search
+                metadatas=[
+                    {
+                        "question_hash": q_hash,
+                        "sql": sql,
+                        "sql_hash": s_hash,
+                        "created_at": int(time.time()),
+                        "question_preview": question[:100],  # For logging/debugging
+                    }
+                ],
+                ids=[cache_id],
+            )
+
+            logger.info(
+                f"[CACHE STORE] New entry cached. "
+                f"ID: {cache_id}, "
+                f"Question: '{question[:50]}...', "
+                f"SQL hash: {s_hash[:16]}..."
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Cache store error: {e}")
+            return False
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        Get cache statistics for monitoring.
+
+        Returns:
+            Dictionary with cache statistics
+        """
+        try:
+            count = self.query_cache.count()
+            return {
+                "enabled": self.cache_enabled,
+                "entry_count": count,
+                "similarity_threshold": self.cache_similarity_threshold,
+                "chroma_path": CHROMA_PATH,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def clear_cache(self) -> bool:
+        """
+        Clear all cached queries. Use with caution.
+
+        Returns:
+            True if cleared successfully
+        """
+        try:
+            # Get all IDs and delete them
+            all_entries = self.query_cache.get()
+            if all_entries and all_entries.get("ids"):
+                self.query_cache.delete(ids=all_entries["ids"])
+                logger.info(
+                    f"[CACHE CLEAR] Deleted {len(all_entries['ids'])} cache entries"
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Cache clear error: {e}")
+            return False
 
     def _get_context(self, question: str) -> str:
         """Get relevant context from ChromaDB"""
@@ -549,14 +863,48 @@ Generate the SQL query:"""
         return sql
 
     def ask(self, question: str) -> Dict[str, Any]:
-        """Process question: generate SQL, execute, and return results"""
-        try:
-            # Generate SQL
-            sql = self.generate_sql(question)
-            logger.info(f"Generated SQL: {sql}")
+        """
+        Process question: check cache, generate SQL if needed, execute, and return results.
 
-            # Execute SQL
+        Cache Strategy (SQL-only, data always fresh from Dremio):
+        1. Check cache for existing SQL (exact match, then semantic similarity)
+        2. If cache hit: use cached SQL, execute on Dremio for fresh data
+        3. If cache miss: generate SQL via LLM, cache it, execute on Dremio
+
+        Args:
+            question: Natural language question
+
+        Returns:
+            Dictionary with question, sql, results, result_text, row_count, and cache_hit
+        """
+        start_time = time.time()
+        cache_hit_type = "miss"
+        sql = None
+
+        try:
+            # Step 1: Check cache for SQL
+            cached_sql, cache_hit_type = self._cache_lookup(question)
+
+            if cached_sql:
+                sql = cached_sql
+                logger.info(f"Using cached SQL ({cache_hit_type} hit)")
+            else:
+                # Step 2: Generate SQL via LLM (cache miss)
+                generation_start = time.time()
+                sql = self.generate_sql(question)
+                generation_time = time.time() - generation_start
+                logger.info(f"Generated SQL in {generation_time:.2f}s: {sql[:100]}...")
+
+                # Step 3: Cache the newly generated SQL
+                self._cache_store(question, sql)
+
+            # Step 4: Execute SQL on Dremio (always, for fresh data)
+            execution_start = time.time()
             df = self.dremio.execute_sql(sql)
+            execution_time = time.time() - execution_start
+            logger.info(
+                f"Dremio execution completed in {execution_time:.2f}s, {len(df)} rows returned"
+            )
 
             # Format results
             if df.empty:
@@ -564,17 +912,37 @@ Generate the SQL query:"""
             else:
                 result_text = df.to_markdown(index=False)
 
+            total_time = time.time() - start_time
+            logger.info(
+                f"[QUERY COMPLETE] Total: {total_time:.2f}s, "
+                f"Cache: {cache_hit_type}, "
+                f"Rows: {len(df)}"
+            )
+
             return {
                 "question": question,
                 "sql": sql,
                 "results": df.to_dict(orient="records"),
                 "result_text": result_text,
                 "row_count": len(df),
+                "cache_hit": cache_hit_type
+                if cache_hit_type in ["exact", "semantic"]
+                else None,
+                "timing": {
+                    "total_seconds": round(total_time, 2),
+                    "cache_hit_type": cache_hit_type,
+                },
             }
 
         except Exception as e:
             logger.error(f"Error processing question: {e}")
-            return {"question": question, "error": str(e)}
+            return {
+                "question": question,
+                "error": str(e),
+                "cache_hit": cache_hit_type
+                if cache_hit_type in ["exact", "semantic"]
+                else None,
+            }
 
 
 # =============================================================================
@@ -684,6 +1052,26 @@ app.add_middleware(
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+
+@app.get("/cache/stats")
+async def cache_stats():
+    """Get SQL cache statistics"""
+    if vanna_engine:
+        return vanna_engine.get_cache_stats()
+    return {"error": "Engine not initialized"}
+
+
+@app.delete("/cache/clear")
+async def cache_clear():
+    """Clear the SQL cache (use with caution)"""
+    if vanna_engine:
+        success = vanna_engine.clear_cache()
+        return {
+            "success": success,
+            "message": "Cache cleared" if success else "Failed to clear cache",
+        }
+    return {"error": "Engine not initialized"}
 
 
 @app.get("/v1/models")
