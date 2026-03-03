@@ -18,32 +18,32 @@ This service translates natural language questions into SQL queries, executes th
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     FastAPI Application                      │
+│                     FastAPI Application                     │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │         OpenAI-Compatible API Endpoints               │  │
 │  │  - /v1/chat/completions (streaming & non-streaming)   │  │
-│  │  - /v1/models                                          │  │
-│  │  - /query (direct testing)                             │  │
-│  │  - /cache/stats, /cache/clear (cache management)       │  │
+│  │  - /v1/models                                         │  │
+│  │  - /query (direct testing)                            │  │
+│  │  - /cache/stats, /cache/clear (cache management)      │  │
 │  └───────────────────────────────────────────────────────┘  │
-│                            ↓                                 │
+│                            ↓                                │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │            VannaNLToSQL Engine                         │  │
-│  │  - Question → SQL generation                           │  │
-│  │  - Context retrieval from ChromaDB                     │  │
-│  │  - Result formatting                                   │  │
+│  │            VannaNLToSQL Engine                        │  │
+│  │  - Question → SQL generation                          │  │
+│  │  - Context retrieval from ChromaDB                    │  │
+│  │  - Result formatting                                  │  │
 │  └───────────────────────────────────────────────────────┘  │
-│           ↓                              ↓                   │
+│           ↓                              ↓                  │
 │  ┌─────────────────┐          ┌─────────────────────┐       │
 │  │   ChromaDB      │          │   DremioClient      │       │
 │  │  Vector Store   │          │   REST API Client   │       │
 │  ├─────────────────┤          └─────────────────────┘       │
-│  │ - DDL Schema    │                     ↓                   │
+│  │ - DDL Schema    │                     ↓                  │
 │  │ - SQL Examples  │          ┌─────────────────────┐       │
 │  │ - Documentation │          │   Dremio Database   │       │
 │  │ - Query Cache   │          └─────────────────────┘       │
-│  └─────────────────┘                                         │
-│           ↓                                                  │
+│  └─────────────────┘                                        │
+│           ↓                                                 │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              OpenAI API (GPT Models)                  │  │
 │  └───────────────────────────────────────────────────────┘  │
