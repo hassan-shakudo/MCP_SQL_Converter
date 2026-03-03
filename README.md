@@ -2,6 +2,12 @@
 
 A FastAPI-based microservice that provides natural language to SQL translation for Dremio databases using Vanna AI and OpenAI. The service exposes an OpenAI-compatible chat completions API for seamless integration.
 
+**Features:**
+- Natural language to SQL translation using GPT models
+- **Semantic SQL caching** — Saves ~5-10s per similar question by caching generated SQL
+- OpenAI-compatible API endpoints (streaming & non-streaming)
+- ChromaDB for semantic search over schemas and SQL examples
+
 ## Overview
 
 This service translates natural language questions into SQL queries, executes them against a Dremio data lakehouse, and returns formatted results. It uses ChromaDB for semantic search over database schemas and SQL examples, combined with OpenAI's language models for SQL generation.
@@ -12,30 +18,32 @@ This service translates natural language questions into SQL queries, executes th
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     FastAPI Application                      │
+│                     FastAPI Application                     │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │         OpenAI-Compatible API Endpoints               │  │
 │  │  - /v1/chat/completions (streaming & non-streaming)   │  │
-│  │  - /v1/models                                          │  │
-│  │  - /query (direct testing)                             │  │
+│  │  - /v1/models                                         │  │
+│  │  - /query (direct testing)                            │  │
+│  │  - /cache/stats, /cache/clear (cache management)      │  │
 │  └───────────────────────────────────────────────────────┘  │
-│                            ↓                                 │
+│                            ↓                                │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │            VannaNLToSQL Engine                         │  │
-│  │  - Question → SQL generation                           │  │
-│  │  - Context retrieval from ChromaDB                     │  │
-│  │  - Result formatting                                   │  │
+│  │            VannaNLToSQL Engine                        │  │
+│  │  - Question → SQL generation                          │  │
+│  │  - Context retrieval from ChromaDB                    │  │
+│  │  - Result formatting                                  │  │
 │  └───────────────────────────────────────────────────────┘  │
-│           ↓                              ↓                   │
+│           ↓                              ↓                  │
 │  ┌─────────────────┐          ┌─────────────────────┐       │
 │  │   ChromaDB      │          │   DremioClient      │       │
 │  │  Vector Store   │          │   REST API Client   │       │
 │  ├─────────────────┤          └─────────────────────┘       │
-│  │ - DDL Schema    │                     ↓                   │
+│  │ - DDL Schema    │                     ↓                  │
 │  │ - SQL Examples  │          ┌─────────────────────┐       │
 │  │ - Documentation │          │   Dremio Database   │       │
-│  └─────────────────┘          └─────────────────────┘       │
-│           ↓                                                  │
+│  │ - Query Cache   │          └─────────────────────┘       │
+│  └─────────────────┘                                        │
+│           ↓                                                 │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              OpenAI API (GPT Models)                  │  │
 │  └───────────────────────────────────────────────────────┘  │
@@ -57,10 +65,13 @@ This service translates natural language questions into SQL queries, executes th
   - Schema training on Dremio table structures
   - Context retrieval using semantic search
   - SQL generation with GPT models
+  - **Semantic SQL caching** (L1 exact match + L3 semantic similarity)
   - Query execution and result formatting
 - Methods:
   - `generate_sql(question)`: Translates natural language to SQL
-  - `ask(question)`: End-to-end query processing
+  - `ask(question)`: End-to-end query processing with cache lookup
+  - `get_cache_stats()`: Returns cache statistics
+  - `clear_cache()`: Clears all cached queries
 
 #### 3. **FastAPI Application**
 - Provides OpenAI-compatible API endpoints
@@ -74,21 +85,21 @@ This service translates natural language questions into SQL queries, executes th
    - Initialize ChromaDB with persistent storage
    - Train on database schema and SQL examples
 
-2. **Query Processing**:
+2. **Query Processing** (with caching):
    ```
    User Question
         ↓
-   Context Retrieval (ChromaDB)
-   - DDL Schema
-   - Similar SQL Examples
-   - Documentation
+   Cache Lookup (ChromaDB query_cache)
+   - L1: Exact question hash match
+   - L3: Semantic similarity (>95%)
         ↓
-   SQL Generation (OpenAI)
-   - System prompt with rules
-   - Context injection
-   - Temperature: 0.1 (deterministic)
+   [Cache Hit] → Use cached SQL
+   [Cache Miss] → Generate SQL:
+      - Context Retrieval (DDL, Examples, Docs)
+      - SQL Generation (OpenAI, temp=0.1)
+      - Store in cache (with deduplication)
         ↓
-   SQL Execution (Dremio)
+   SQL Execution (Dremio) — Always runs for fresh data
    - Job submission
    - Status polling
    - Result retrieval
@@ -96,6 +107,7 @@ This service translates natural language questions into SQL queries, executes th
    Response Formatting
    - Markdown tables
    - JSON results
+   - Cache hit indicator
    ```
 
 3. **Response Types**:
@@ -149,6 +161,10 @@ OPENAI_MODEL=gpt-4
 
 # ChromaDB Storage
 CHROMA_PATH=/tmp/chroma_db
+
+# SQL Cache Configuration
+CACHE_ENABLED=true                    # Enable/disable SQL caching
+CACHE_SIMILARITY_THRESHOLD=0.05       # Cosine distance threshold (0.05 = 95% similarity)
 
 # Service Port
 PORT=8787
@@ -300,7 +316,44 @@ Response:
     {"_meta_resort": "SANDIA", "total_visits": 8976.0}
   ],
   "result_text": "| _meta_resort | total_visits |\n|:-------------|-------------:|\n| PURGATORY    | 15234.0      |\n| SANDIA       | 8976.0       |",
-  "row_count": 2
+  "row_count": 2,
+  "cache_hit": null,
+  "timing": {
+    "total_seconds": 25.32,
+    "cache_hit_type": "miss"
+  }
+}
+```
+
+### Cache Management Endpoints
+
+#### Get Cache Statistics
+
+```bash
+curl http://localhost:8787/cache/stats
+```
+
+Response:
+```json
+{
+  "enabled": true,
+  "entry_count": 42,
+  "similarity_threshold": 0.05,
+  "chroma_path": "/tmp/chroma_db"
+}
+```
+
+#### Clear Cache
+
+```bash
+curl -X DELETE http://localhost:8787/cache/clear
+```
+
+Response:
+```json
+{
+  "success": true,
+  "message": "Cache cleared"
 }
 ```
 
@@ -391,8 +444,18 @@ logging.basicConfig(level=logging.DEBUG)
 
 - "Successfully authenticated with Dremio" - Dremio connection established
 - "Schema training complete" - ChromaDB initialized
+- "SQL Cache initialized" - Cache ready with entry count
 - "Generated SQL: [query]" - SQL generated for user question
 - "Error executing SQL: [error]" - Query execution failed
+
+### Cache Log Messages
+
+- `[CACHE HIT - EXACT]` - Exact question match found
+- `[CACHE HIT - SEMANTIC]` - Similar question found (shows similarity %)
+- `[CACHE MISS]` - No cached SQL found, generating new
+- `[CACHE STORE]` - New SQL cached
+- `[CACHE DEDUP]` - SQL already cached from different question (skipped)
+- `[QUERY COMPLETE]` - Summary with timing and cache status
 
 ### Common Issues
 
