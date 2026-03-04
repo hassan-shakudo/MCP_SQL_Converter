@@ -39,7 +39,8 @@ DREMIO_PASSWORD = os.getenv("DREMIO_PASSWORD", "Shakudo312!")
 DREMIO_SSL = os.getenv("DREMIO_SSL", "false").lower() == "true"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "300"))
 
 CHROMA_PATH = os.getenv("CHROMA_PATH", "/tmp/chroma_db")
 
@@ -849,6 +850,7 @@ Generate the SQL query:"""
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
+            max_tokens=OPENAI_MAX_TOKENS,
         )
 
         sql = response.choices[0].message.content.strip()
