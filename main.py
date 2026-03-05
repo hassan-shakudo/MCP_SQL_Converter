@@ -174,14 +174,36 @@ class DremioClient:
             "Content-Type": "application/json",
         }
 
-    def execute_sql(self, sql: str) -> pd.DataFrame:
-        """Execute SQL query and return DataFrame, with automatic token refresh on 401"""
+    def execute_sql(self, sql: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """
+        Execute SQL query and return DataFrame with timing metrics.
+
+        Returns:
+            Tuple of (DataFrame, timing_dict) where timing_dict contains:
+            - submit_ms: Time to submit job to Dremio
+            - poll_ms: Time spent polling for completion
+            - poll_count: Number of poll iterations
+            - fetch_ms: Time to fetch results
+            - total_ms: Total execution time
+            - job_id: Dremio job ID for debugging
+        """
+        timing = {
+            "submit_ms": 0,
+            "poll_ms": 0,
+            "poll_count": 0,
+            "fetch_ms": 0,
+            "total_ms": 0,
+            "job_id": None,
+        }
+        exec_start = time.time()
+
         for attempt in range(2):
             if not self.token:
                 if not self.login():
                     raise Exception("Failed to authenticate with Dremio")
             try:
                 # Submit job
+                submit_start = time.time()
                 response = self.client.post(
                     f"{self.base_url}/api/v3/sql",
                     headers=self._get_headers(),
@@ -190,10 +212,19 @@ class DremioClient:
                 response.raise_for_status()
                 job_data = response.json()
                 job_id = job_data.get("id")
+                timing["submit_ms"] = int((time.time() - submit_start) * 1000)
+                timing["job_id"] = job_id
+
+                logger.info(
+                    f"[DREMIO] Job submitted: {job_id} ({timing['submit_ms']}ms)"
+                )
 
                 # Poll for job completion
+                poll_start = time.time()
                 max_attempts = 60
-                for _ in range(max_attempts):
+                poll_count = 0
+                for i in range(max_attempts):
+                    poll_count = i + 1
                     status_response = self.client.get(
                         f"{self.base_url}/api/v3/job/{job_id}",
                         headers=self._get_headers(),
@@ -212,7 +243,14 @@ class DremioClient:
                 else:
                     raise Exception("Query timeout")
 
+                timing["poll_ms"] = int((time.time() - poll_start) * 1000)
+                timing["poll_count"] = poll_count
+                logger.info(
+                    f"[DREMIO] Job completed: {poll_count} polls, {timing['poll_ms']}ms"
+                )
+
                 # Get results
+                fetch_start = time.time()
                 results_response = self.client.get(
                     f"{self.base_url}/api/v3/job/{job_id}/results",
                     headers=self._get_headers(),
@@ -220,12 +258,24 @@ class DremioClient:
                 )
                 results_response.raise_for_status()
                 results_data = results_response.json()
+                timing["fetch_ms"] = int((time.time() - fetch_start) * 1000)
 
                 # Convert to DataFrame
                 rows = results_data.get("rows", [])
+                timing["total_ms"] = int((time.time() - exec_start) * 1000)
+
+                logger.info(
+                    f"[DREMIO] Execution complete: "
+                    f"submit={timing['submit_ms']}ms, "
+                    f"poll={timing['poll_ms']}ms ({timing['poll_count']} iterations), "
+                    f"fetch={timing['fetch_ms']}ms, "
+                    f"total={timing['total_ms']}ms, "
+                    f"rows={len(rows)}"
+                )
+
                 if rows:
-                    return pd.DataFrame(rows)
-                return pd.DataFrame()
+                    return pd.DataFrame(rows), timing
+                return pd.DataFrame(), timing
 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 401 and attempt == 0:
@@ -877,36 +927,38 @@ Generate the SQL query:"""
             question: Natural language question
 
         Returns:
-            Dictionary with question, sql, results, result_text, row_count, and cache_hit
+            Dictionary with question, sql, results, result_text, row_count, cache_hit, and detailed timing
         """
         start_time = time.time()
         cache_hit_type = "miss"
         sql = None
+        generation_time_ms = 0
+        cache_lookup_time_ms = 0
+        dremio_timing = {}
 
         try:
             # Step 1: Check cache for SQL
+            cache_lookup_start = time.time()
             cached_sql, cache_hit_type = self._cache_lookup(question)
+            cache_lookup_time_ms = int((time.time() - cache_lookup_start) * 1000)
 
             if cached_sql:
                 sql = cached_sql
-                logger.info(f"Using cached SQL ({cache_hit_type} hit)")
+                logger.info(
+                    f"Using cached SQL ({cache_hit_type} hit) - lookup took {cache_lookup_time_ms}ms"
+                )
             else:
                 # Step 2: Generate SQL via LLM (cache miss)
                 generation_start = time.time()
                 sql = self.generate_sql(question)
-                generation_time = time.time() - generation_start
-                logger.info(f"Generated SQL in {generation_time:.2f}s: {sql[:100]}...")
+                generation_time_ms = int((time.time() - generation_start) * 1000)
+                logger.info(f"Generated SQL in {generation_time_ms}ms: {sql[:100]}...")
 
                 # Step 3: Cache the newly generated SQL
                 self._cache_store(question, sql)
 
             # Step 4: Execute SQL on Dremio (always, for fresh data)
-            execution_start = time.time()
-            df = self.dremio.execute_sql(sql)
-            execution_time = time.time() - execution_start
-            logger.info(
-                f"Dremio execution completed in {execution_time:.2f}s, {len(df)} rows returned"
-            )
+            df, dremio_timing = self.dremio.execute_sql(sql)
 
             # Format results
             if df.empty:
@@ -914,10 +966,18 @@ Generate the SQL query:"""
             else:
                 result_text = df.to_markdown(index=False)
 
-            total_time = time.time() - start_time
+            total_time_ms = int((time.time() - start_time) * 1000)
+
+            # Detailed timing summary
             logger.info(
-                f"[QUERY COMPLETE] Total: {total_time:.2f}s, "
-                f"Cache: {cache_hit_type}, "
+                f"[QUERY COMPLETE] "
+                f"Total: {total_time_ms}ms | "
+                f"Cache lookup: {cache_lookup_time_ms}ms ({cache_hit_type}) | "
+                f"LLM generation: {generation_time_ms}ms | "
+                f"Dremio: {dremio_timing.get('total_ms', 0)}ms "
+                f"(submit={dremio_timing.get('submit_ms', 0)}ms, "
+                f"poll={dremio_timing.get('poll_ms', 0)}ms/{dremio_timing.get('poll_count', 0)} iterations, "
+                f"fetch={dremio_timing.get('fetch_ms', 0)}ms) | "
                 f"Rows: {len(df)}"
             )
 
@@ -931,8 +991,16 @@ Generate the SQL query:"""
                 if cache_hit_type in ["exact", "semantic"]
                 else None,
                 "timing": {
-                    "total_seconds": round(total_time, 2),
+                    "total_ms": total_time_ms,
+                    "cache_lookup_ms": cache_lookup_time_ms,
                     "cache_hit_type": cache_hit_type,
+                    "llm_generation_ms": generation_time_ms,
+                    "dremio_total_ms": dremio_timing.get("total_ms", 0),
+                    "dremio_submit_ms": dremio_timing.get("submit_ms", 0),
+                    "dremio_poll_ms": dremio_timing.get("poll_ms", 0),
+                    "dremio_poll_count": dremio_timing.get("poll_count", 0),
+                    "dremio_fetch_ms": dremio_timing.get("fetch_ms", 0),
+                    "dremio_job_id": dremio_timing.get("job_id"),
                 },
             }
 
