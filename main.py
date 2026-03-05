@@ -532,33 +532,57 @@ class VannaNLToSQL:
 
         logger.info("Schema training complete")
 
-    def _get_context(self, question: str) -> str:
-        """Get relevant context from ChromaDB"""
+    def _get_context(self, question: str) -> dict:
+        """Get relevant context from ChromaDB with detailed timing"""
         context_parts = []
+        timing = {}
 
         # Get DDL
+        t0 = time.time()
         ddl_results = self.ddl_collection.query(query_texts=[question], n_results=1)
+        timing["ddl_query_ms"] = int((time.time() - t0) * 1000)
         if ddl_results["documents"]:
             context_parts.append("## Table Schema\n" + ddl_results["documents"][0][0])
 
         # Get similar SQL examples (reduced from 3 to 1 for faster responses)
+        t1 = time.time()
         sql_results = self.sql_collection.query(query_texts=[question], n_results=1)
+        timing["sql_query_ms"] = int((time.time() - t1) * 1000)
         if sql_results["documents"]:
             context_parts.append("## Similar SQL Examples")
             for doc in sql_results["documents"][0]:
                 context_parts.append(doc)
 
         # Get documentation
+        t2 = time.time()
         doc_results = self.doc_collection.query(query_texts=[question], n_results=1)
+        timing["doc_query_ms"] = int((time.time() - t2) * 1000)
         if doc_results["documents"]:
             context_parts.append("## Documentation\n" + doc_results["documents"][0][0])
 
-        return "\n\n".join(context_parts)
+        context_text = "\n\n".join(context_parts)
+        timing["total_context_ms"] = (
+            timing["ddl_query_ms"] + timing["sql_query_ms"] + timing["doc_query_ms"]
+        )
 
-    def generate_sql(self, question: str) -> str:
-        """Generate SQL from natural language question"""
-        context = self._get_context(question)
+        logger.info(
+            f"[TIMING] ChromaDB breakdown: DDL={timing['ddl_query_ms']}ms, SQL={timing['sql_query_ms']}ms, Doc={timing['doc_query_ms']}ms, Total={timing['total_context_ms']}ms"
+        )
 
+        return {"context": context_text, "timing": timing}
+
+    def generate_sql(self, question: str) -> dict:
+        """Generate SQL from natural language question with detailed timing"""
+        timing = {}
+
+        # Step 1: Get context from ChromaDB (includes embedding generation)
+        t0 = time.time()
+        context_result = self._get_context(question)
+        context = context_result["context"]
+        timing["chromadb"] = context_result["timing"]
+
+        # Step 2: Build prompts
+        t1 = time.time()
         system_prompt = """You are an expert SQL analyst for Dremio. Generate SQL queries based on user questions.
 
 IMPORTANT RULES:
@@ -585,6 +609,18 @@ Question: {question}
 
 Generate the SQL query:"""
 
+        timing["prompt_build_ms"] = int((time.time() - t1) * 1000)
+
+        # Log prompt sizes for debugging
+        system_tokens_est = len(system_prompt) // 4
+        user_tokens_est = len(user_prompt) // 4
+        logger.info(
+            f"[TIMING] Prompt sizes: system~{system_tokens_est} tokens, user~{user_tokens_est} tokens, total~{system_tokens_est + user_tokens_est} tokens"
+        )
+
+        # Step 3: Call OpenAI API
+        t2 = time.time()
+        logger.info(f"[TIMING] Starting OpenAI API call to {self.model}...")
         response = self.openai.chat.completions.create(
             model=self.model,
             messages=[
@@ -593,6 +629,13 @@ Generate the SQL query:"""
             ],
             temperature=0.1,
             max_tokens=OPENAI_MAX_TOKENS,
+        )
+        timing["openai_api_ms"] = int((time.time() - t2) * 1000)
+
+        # Log OpenAI response metadata
+        usage = response.usage
+        logger.info(
+            f"[TIMING] OpenAI API completed in {timing['openai_api_ms']}ms - prompt_tokens={usage.prompt_tokens}, completion_tokens={usage.completion_tokens}, total_tokens={usage.total_tokens}"
         )
 
         sql = response.choices[0].message.content.strip()
@@ -604,7 +647,17 @@ Generate the SQL query:"""
             sql = sql[:-3]
         sql = sql.strip()
 
-        return sql
+        # Summary timing log
+        total_ms = (
+            timing["chromadb"]["total_context_ms"]
+            + timing["prompt_build_ms"]
+            + timing["openai_api_ms"]
+        )
+        logger.info(
+            f"[TIMING] generate_sql breakdown: ChromaDB={timing['chromadb']['total_context_ms']}ms, PromptBuild={timing['prompt_build_ms']}ms, OpenAI={timing['openai_api_ms']}ms, TOTAL={total_ms}ms"
+        )
+
+        return {"sql": sql, "timing": timing}
 
     def ask(self, question: str) -> Dict[str, Any]:
         """
@@ -621,9 +674,11 @@ Generate the SQL query:"""
         dremio_timing = {}
 
         try:
-            # Step 1: Generate SQL via LLM
+            # Step 1: Generate SQL via LLM (with detailed timing)
             generation_start = time.time()
-            sql = self.generate_sql(question)
+            generate_result = self.generate_sql(question)
+            sql = generate_result["sql"]
+            llm_timing = generate_result["timing"]
             generation_time_ms = int((time.time() - generation_start) * 1000)
             logger.info(f"Generated SQL in {generation_time_ms}ms: {sql[:100]}...")
 
@@ -659,6 +714,14 @@ Generate the SQL query:"""
                 "timing": {
                     "total_ms": total_time_ms,
                     "llm_generation_ms": generation_time_ms,
+                    "llm_breakdown": {
+                        "chromadb_total_ms": llm_timing["chromadb"]["total_context_ms"],
+                        "chromadb_ddl_ms": llm_timing["chromadb"]["ddl_query_ms"],
+                        "chromadb_sql_ms": llm_timing["chromadb"]["sql_query_ms"],
+                        "chromadb_doc_ms": llm_timing["chromadb"]["doc_query_ms"],
+                        "prompt_build_ms": llm_timing["prompt_build_ms"],
+                        "openai_api_ms": llm_timing["openai_api_ms"],
+                    },
                     "dremio_total_ms": dremio_timing.get("total_ms", 0),
                     "dremio_submit_ms": dremio_timing.get("submit_ms", 0),
                     "dremio_poll_ms": dremio_timing.get("poll_ms", 0),
